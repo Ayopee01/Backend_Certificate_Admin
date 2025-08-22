@@ -2,10 +2,12 @@
 const JSZip = require('jszip');
 const sharp = require('sharp');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const { hexToRgb01, slug } = require('../utils/helpers');
+const fontkit = require('fontkit'); // <— สำคัญ ต้องมีเพื่อรองรับฟอนต์ .ttf/.otf
+const { hexToRgb01, slug } = require('./utils/helpers');
 
+/** สร้าง SVG overlay สำหรับกรณี template เป็นรูปภาพ (ใช้กับ sharp) */
 function svgTextOverlay({ w, h, x, y, text, color, fontSize, family, weight = 400, letterSpacing = 0, fontFileBuf }) {
-  // ถ้ามีฟอนต์ custom ให้ฝังด้วย @font-face (base64)
+  // ถ้ามีฟอนต์ custom ให้ฝังผ่าน @font-face (base64)
   let fontFace = '';
   let familyToUse = family || 'sans-serif';
   if (fontFileBuf && fontFileBuf.length) {
@@ -39,6 +41,7 @@ function svgTextOverlay({ w, h, x, y, text, color, fontSize, family, weight = 40
   );
 }
 
+/** วางชื่อบนรูปภาพแล้วส่งออกเป็น PNG */
 async function renderImageToPng({ templateBuf, name, xRel, yRel, color, fontSize, family, weight, letterSpacing, fontFileBuf }) {
   const meta = await sharp(templateBuf).metadata();
   const w = meta.width, h = meta.height;
@@ -61,21 +64,24 @@ async function renderImageToPng({ templateBuf, name, xRel, yRel, color, fontSize
   return out;
 }
 
+/** วางชื่อบนหน้า PDF (template เป็น PDF) */
 async function renderPdfPage({
   templatePdfBuf, pageIndex = 0, name,
   xRel, yRel, color, fontSize, family, letterSpacing, fontFileBuf
 }) {
   const src = await PDFDocument.load(templatePdfBuf);
   const out = await PDFDocument.create();
+  out.registerFontkit(fontkit); // <— เพิ่มบรรทัดนี้
+
   const pages = await out.copyPages(src, [pageIndex]);
   const page = pages[0];
   out.addPage(page);
 
-  // ฟอนต์
+  // ฟอนต์ (ถ้าอัปโหลดมาให้ฝัง; ถ้าไม่มีก็ fallback)
   let font;
   if (fontFileBuf && fontFileBuf.length) {
     try {
-      font = await out.embedFont(fontFileBuf);
+      font = await out.embedFont(fontFileBuf, { subset: true });
     } catch {
       font = await out.embedStandardFont(StandardFonts.Helvetica);
     }
@@ -86,7 +92,7 @@ async function renderPdfPage({
   const { r, g, b } = hexToRgb01(color || '#000000');
   const { width, height } = page.getSize();
 
-  // คำนวณพิกัด — y จากบนลงล่าง (front ส่งมาแบบนี้)
+  // พิกัดจากบนลงล่าง
   const x = (xRel || 0.5) * width;
   const yFromTop = (yRel || 0.5) * height;
   const y = height - yFromTop;
@@ -97,24 +103,25 @@ async function renderPdfPage({
     size: fontSize,
     font,
     color: rgb(r, g, b),
-    // pdf-lib ใช้ characterSpacing แทน letter-spacing (หน่วยเป็น pt)
-    characterSpacing: Number(letterSpacing || 0)
+    characterSpacing: Number(letterSpacing || 0) // หน่วย pt
   });
 
   return await out.save();
 }
 
+/** วางชื่อบนรูป แล้วส่งออกเป็น PDF */
 async function renderImageToPdf({ templateImageBuf, name, xRel, yRel, color, fontSize, family, letterSpacing, fontFileBuf }) {
   const out = await PDFDocument.create();
+  out.registerFontkit(fontkit); // <— เพิ่มบรรทัดนี้
 
-  // รู้ขนาดรูป
+  // อ่านขนาดรูป
   const meta = await sharp(templateImageBuf).metadata();
   const w = meta.width || 2000;
   const h = meta.height || 1414;
 
   const page = out.addPage([w, h]);
 
-  // ฝังรูปลง PDF
+  // ฝังรูปเป็นพื้นหลัง
   let img;
   if (/png/i.test(meta.format)) img = await out.embedPng(templateImageBuf);
   else img = await out.embedJpg(templateImageBuf);
@@ -124,7 +131,7 @@ async function renderImageToPdf({ templateImageBuf, name, xRel, yRel, color, fon
   let font;
   if (fontFileBuf && fontFileBuf.length) {
     try {
-      font = await out.embedFont(fontFileBuf);
+      font = await out.embedFont(fontFileBuf, { subset: true });
     } catch {
       font = await out.embedStandardFont(StandardFonts.Helvetica);
     }
@@ -150,13 +157,14 @@ async function renderImageToPdf({ templateImageBuf, name, xRel, yRel, color, fon
   return await out.save();
 }
 
+/** รวมทุกอย่างแล้วแพ็กเป็น ZIP */
 exports.renderZip = async function renderZip({
   templateBuf,
   templateMime,    // 'application/pdf' หรือ 'image/png/jpeg'
   rows,            // [{...}]
-  nameColumn,      // คอลัมน์ชื่อ
+  nameColumn,      // ชื่อคอลัมน์
   outputFormat,    // 'pdf' | 'png'
-  mode,            // 'pdf' | 'image' (หรือ 'auto' ที่ server แปลงมาแล้ว)
+  mode,            // 'pdf' | 'image'
   pageIndex = 0,
   xRel, yRel,
   color = '#000',
@@ -185,7 +193,6 @@ exports.renderZip = async function renderZip({
       });
       zip.file(`${fileSafe}.pdf`, pdfBytes);
     } else if (mode === 'image' && outputFormat === 'png') {
-      // รูป -> PNG
       const png = await renderImageToPng({
         templateBuf,
         name,
@@ -197,7 +204,6 @@ exports.renderZip = async function renderZip({
       });
       zip.file(`${fileSafe}.png`, png);
     } else if (mode === 'image' && outputFormat === 'pdf') {
-      // รูป -> แปลงเป็น PDF แล้ววางตัวหนังสือ
       const pdf = await renderImageToPdf({
         templateImageBuf: templateBuf,
         name, xRel, yRel, color, fontSize,
