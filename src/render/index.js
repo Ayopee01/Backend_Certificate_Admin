@@ -2,55 +2,62 @@
 const JSZip = require('jszip');
 const sharp = require('sharp');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
-const fontkit = require('fontkit'); // สำคัญ: รองรับ .ttf/.otf
+const fontkit = require('@pdf-lib/fontkit');        // ใช้ตัวนี้แทน fontkit ตรง ๆ
 const { hexToRgb01, slug } = require('../utils/helpers');
 
-/** ===== SVG overlay (กรณี template เป็นรูปภาพ → ใช้ร่วมกับ sharp) ===== */
+/** สร้าง SVG overlay สำหรับกรณี template เป็น "รูปภาพ" (ใช้กับ sharp) */
 function svgTextOverlay({
-  w, h, x, y, text, color, fontSize, family,
-  weight = 400, letterSpacing = 0, fontFileBuf
+  w, h, x, y,
+  text, color,
+  fontSize, family,
+  weight = 400,
+  letterSpacing = 0,
+  fontFileBuf
 }) {
+  // ถ้ามีฟอนต์ custom ให้ฝังผ่าน @font-face (base64)
   let fontFace = '';
   let familyToUse = family || 'sans-serif';
-
-  // ถ้ามีฟอนต์ custom → ฝังผ่าน @font-face แบบ data URL
   if (fontFileBuf && fontFileBuf.length) {
     const b64 = fontFileBuf.toString('base64');
     familyToUse = 'UserFontEmbed';
     fontFace = `
-    @font-face{
-      font-family:'${familyToUse}';
-      /* บางเครื่องต้องการ mime ที่ต่างกัน ลองสองแบบ */
-      src:url('data:font/ttf;base64,${b64}') format('truetype'),
-          url('data:application/font-sfnt;base64,${b64}') format('truetype');
-      font-weight:100 900;
-      font-style:normal;
-      font-display:swap;
+    @font-face {
+      font-family: '${familyToUse}';
+      src: url('data:font/ttf;base64,${b64}') format('truetype');
+      font-weight: 100 900;
+      font-style: normal;
+      font-display: swap;
     }`;
   }
 
   const esc = (s) =>
-    String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    String(s).replace(/&/g, '&amp;')
+             .replace(/</g, '&lt;')
+             .replace(/>/g, '&gt;');
 
   return Buffer.from(
-`<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
-  <style>
-    ${fontFace}
-    text{
-      font-family:${familyToUse};
-      font-weight:${weight};
-      font-size:${fontSize}px;
-      fill:${color};
-      letter-spacing:${letterSpacing}px;
-    }
-  </style>
-  <text x="${x}" y="${y}" dominant-baseline="middle" text-anchor="middle">${esc(text)}</text>
-</svg>`
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">
+      <style>
+        ${fontFace}
+        text {
+          font-family: ${familyToUse};
+          font-weight: ${weight};
+          font-size: ${fontSize}px;
+          fill: ${color};
+          letter-spacing: ${letterSpacing}px;
+        }
+      </style>
+      <text x="${x}" y="${y}" dominant-baseline="middle" text-anchor="middle">${esc(text)}</text>
+    </svg>`
   );
 }
 
+/** วางชื่อบน "ไฟล์รูป" แล้วส่งออกเป็น PNG */
 async function renderImageToPng({
-  templateBuf, name, xRel, yRel, color, fontSize, family, weight, letterSpacing, fontFileBuf
+  templateBuf, name,
+  xRel, yRel, color,
+  fontSize, family, weight,
+  letterSpacing, fontFileBuf
 }) {
   const meta = await sharp(templateBuf).metadata();
   const w = meta.width, h = meta.height;
@@ -61,119 +68,121 @@ async function renderImageToPng({
   const svg = svgTextOverlay({
     w, h, x, y,
     text: name,
-    color, fontSize, family, weight, letterSpacing,
-    fontFileBuf
+    color, fontSize, family, weight,
+    letterSpacing, fontFileBuf
   });
 
-  return await sharp(templateBuf).composite([{ input: svg }]).png().toBuffer();
+  const out = await sharp(templateBuf)
+    .composite([{ input: svg }])
+    .png()
+    .toBuffer();
+
+  return out;
 }
 
-/** ===== วางชื่อบนหน้า PDF (template เป็น PDF) ===== */
+/** helper: เลือก/ฝังฟอนต์ลง PDF (ไม่ subset เพื่อกัน glyph หาย) */
+async function pickPdfFont(pdfDoc, fontFileBuf) {
+  if (fontFileBuf && fontFileBuf.length) {
+    try {
+      pdfDoc.registerFontkit(fontkit); // สำคัญ!
+      // ปิด subset เพื่อกันอักขระหาย, โดยเฉพาะสคริปต์/ligature
+      return await pdfDoc.embedFont(fontFileBuf, { subset: false });
+    } catch {
+      return await pdfDoc.embedStandardFont(StandardFonts.Helvetica);
+    }
+  }
+  return await pdfDoc.embedStandardFont(StandardFonts.Helvetica);
+}
+
+/** วางชื่อบนหน้า PDF (template เป็น PDF) */
 async function renderPdfPage({
   templatePdfBuf, pageIndex = 0, name,
-  xRel, yRel, color, fontSize, family, letterSpacing, fontFileBuf
+  xRel, yRel, color, fontSize,
+  family, letterSpacing, fontFileBuf
 }) {
   const src = await PDFDocument.load(templatePdfBuf);
   const out = await PDFDocument.create();
-  out.registerFontkit(fontkit);
 
-  const [page] = await out.copyPages(src, [pageIndex]);
+  const pages = await out.copyPages(src, [pageIndex]);
+  const page = pages[0];
   out.addPage(page);
 
-  // ฝังฟอนต์: ปิด subset เพื่อไม่ตัด glyph ทิ้ง (แก้ปัญหาตัวอักษรหาย)
-  let font;
-  const text = String(name ?? '').normalize('NFC');
-  try {
-    if (fontFileBuf && fontFileBuf.length) {
-      font = await out.embedFont(fontFileBuf, {
-        subset: false,               // <-- จุดแก้หลัก
-        customName: 'UserFontEmbed',
-      });
-    } else {
-      font = await out.embedStandardFont(StandardFonts.Helvetica);
-    }
-  } catch {
-    font = await out.embedStandardFont(StandardFonts.Helvetica);
-  }
+  const font = await pickPdfFont(out, fontFileBuf);
 
   const { r, g, b } = hexToRgb01(color || '#000000');
   const { width, height } = page.getSize();
 
+  // พิกัดจากบนลงล่าง
   const x = (xRel || 0.5) * width;
   const yFromTop = (yRel || 0.5) * height;
   const y = height - yFromTop;
 
+  const text = String(name || '');
+  const textWidth = font.widthOfTextAtSize(text, fontSize);
+
   page.drawText(text, {
-    // จัดกลางโดยประเมินความกว้างจากฟอนต์จริง
-    x: x - font.widthOfTextAtSize(text, fontSize) / 2,
+    x: x - textWidth / 2, // จัดกลาง
     y,
     size: fontSize,
     font,
     color: rgb(r, g, b),
-    characterSpacing: Number(letterSpacing || 0), // หน่วย pt
+    characterSpacing: Number(letterSpacing || 0) // หน่วย pt
   });
 
   return await out.save();
 }
 
-/** ===== วางชื่อบนรูป แล้วส่งออกเป็น PDF ===== */
+/** วางชื่อบน "ไฟล์รูป" แล้วส่งออกเป็น PDF */
 async function renderImageToPdf({
-  templateImageBuf, name, xRel, yRel, color, fontSize, family, letterSpacing, fontFileBuf
+  templateImageBuf, name,
+  xRel, yRel, color, fontSize,
+  family, letterSpacing, fontFileBuf
 }) {
   const out = await PDFDocument.create();
-  out.registerFontkit(fontkit);
 
+  // อ่านขนาดรูป
   const meta = await sharp(templateImageBuf).metadata();
   const w = meta.width || 2000;
   const h = meta.height || 1414;
 
   const page = out.addPage([w, h]);
 
+  // ฝังรูปเป็นพื้นหลัง
   let img;
   if (/png/i.test(meta.format)) img = await out.embedPng(templateImageBuf);
   else img = await out.embedJpg(templateImageBuf);
   page.drawImage(img, { x: 0, y: 0, width: w, height: h });
 
-  let font;
-  const text = String(name ?? '').normalize('NFC');
-  try {
-    if (fontFileBuf && fontFileBuf.length) {
-      font = await out.embedFont(fontFileBuf, {
-        subset: false,               // <-- ปิด subset เช่นกัน
-        customName: 'UserFontEmbed',
-      });
-    } else {
-      font = await out.embedStandardFont(StandardFonts.Helvetica);
-    }
-  } catch {
-    font = await out.embedStandardFont(StandardFonts.Helvetica);
-  }
-
+  const font = await pickPdfFont(out, fontFileBuf);
   const { r, g, b } = hexToRgb01(color || '#000000');
+
   const x = (xRel || 0.5) * w;
   const yFromTop = (yRel || 0.5) * h;
   const y = h - yFromTop;
 
+  const text = String(name || '');
+  const textWidth = font.widthOfTextAtSize(text, fontSize);
+
   page.drawText(text, {
-    x: x - font.widthOfTextAtSize(text, fontSize) / 2,
+    x: x - textWidth / 2,
     y,
     size: fontSize,
     font,
     color: rgb(r, g, b),
-    characterSpacing: Number(letterSpacing || 0),
+    characterSpacing: Number(letterSpacing || 0)
   });
 
   return await out.save();
 }
 
-/** ===== รวมทุกอย่างแล้วแพ็กเป็น ZIP ===== */
+/** รวมทุกอย่างแล้วแพ็กเป็น ZIP */
 exports.renderZip = async function renderZip({
   templateBuf,
-  templateMime,        // 'application/pdf' | image/*
-  rows,                // [{...}]
-  nameColumn,          // key ของชื่อ
-  outputFormat,        // 'pdf' | 'png'
-  mode,                // 'pdf' | 'image'
+  templateMime,    // 'application/pdf' หรือ 'image/png/jpeg'
+  rows,            // [{...}]
+  nameColumn,      // ชื่อคอลัมน์
+  outputFormat,    // 'pdf' | 'png'
+  mode,            // 'pdf' | 'image'
   pageIndex = 0,
   xRel, yRel,
   color = '#000',
@@ -181,8 +190,8 @@ exports.renderZip = async function renderZip({
   fontFamily = 'sans-serif',
   fontWeight = 700,
   letterSpacing = 0,
-  fontFileBuf,         // optional
-  filenamePrefix = 'CERT_',
+  fontFileBuf,     // optional - .ttf/.otf ที่อัปโหลดจากหน้าเว็บ
+  filenamePrefix = 'CERT_'
 }) {
   const zip = new JSZip();
 
@@ -198,7 +207,7 @@ exports.renderZip = async function renderZip({
         xRel, yRel, color, fontSize,
         family: fontFamily,
         letterSpacing,
-        fontFileBuf,
+        fontFileBuf
       });
       zip.file(`${fileSafe}.pdf`, pdfBytes);
     } else if (mode === 'image' && outputFormat === 'png') {
@@ -209,7 +218,7 @@ exports.renderZip = async function renderZip({
         family: fontFamily,
         weight: fontWeight,
         letterSpacing,
-        fontFileBuf,
+        fontFileBuf
       });
       zip.file(`${fileSafe}.png`, png);
     } else if (mode === 'image' && outputFormat === 'pdf') {
@@ -218,13 +227,11 @@ exports.renderZip = async function renderZip({
         name, xRel, yRel, color, fontSize,
         family: fontFamily,
         letterSpacing,
-        fontFileBuf,
+        fontFileBuf
       });
       zip.file(`${fileSafe}.pdf`, pdf);
     } else {
-      throw new Error(
-        `ไม่รองรับโหมดนี้ (mode=${mode}, templateMime=${templateMime}, outputFormat=${outputFormat})`
-      );
+      throw new Error(`ไม่รองรับโหมดนี้ (mode=${mode}, templateMime=${templateMime}, outputFormat=${outputFormat})`);
     }
   }
 
