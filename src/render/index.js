@@ -3,7 +3,7 @@ const JSZip = require('jszip');
 const sharp = require('sharp');
 const { PDFDocument, StandardFonts, rgb } = require('pdf-lib');
 const fontkit = require('fontkit'); // <— สำคัญ ต้องมีเพื่อรองรับฟอนต์ .ttf/.otf
-const { hexToRgb01, slug } = require('./utils/helpers');
+const { hexToRgb01, slug } = require('../utils/helpers');
 
 /** สร้าง SVG overlay สำหรับกรณี template เป็นรูปภาพ (ใช้กับ sharp) */
 function svgTextOverlay({ w, h, x, y, text, color, fontSize, family, weight = 400, letterSpacing = 0, fontFileBuf }) {
